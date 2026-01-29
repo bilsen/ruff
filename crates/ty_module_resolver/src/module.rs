@@ -1,6 +1,8 @@
 use std::fmt::Formatter;
 use std::str::FromStr;
 
+use rustc_hash::FxHashSet;
+
 use ruff_db::files::{File, system_path_to_file, vendored_path_to_file};
 use ruff_db::system::SystemPath;
 use ruff_db::vendored::VendoredPath;
@@ -10,6 +12,7 @@ use salsa::plumbing::AsId;
 use crate::Db;
 use crate::module_name::ModuleName;
 use crate::path::{SearchPath, SystemOrVendoredPathRef};
+use crate::resolve::{ModuleResolveMode, search_paths};
 
 /// Representation of a Python module.
 #[derive(Clone, Copy, Eq, Hash, PartialEq, salsa::Supertype, salsa::Update)]
@@ -91,8 +94,10 @@ impl<'db> Module<'db> {
 
     /// Return a list of all submodules of this module.
     ///
-    /// Returns an empty list if the module is not a package, if it is an empty package,
-    /// or if it is a namespace package (one without an `__init__.py` or `__init__.pyi` file).
+    /// Returns an empty list if the module is not a package or if it is an empty package.
+    ///
+    /// For namespace packages, this iterates over all search paths and collects
+    /// submodules from each directory that contributes to the namespace package.
     ///
     /// The names returned correspond to the "base" name of the module.
     /// That is, `{self.name}.{basename}` should give the full module name.
@@ -148,14 +153,179 @@ fn all_submodule_names_for_package<'db>(
             .ok()
     }
 
-    // It would be complex and expensive to compute all submodules for
-    // namespace packages, since a namespace package doesn't correspond
-    // to a single file; it can span multiple directories across multiple
-    // search paths. For now, we only compute submodules for traditional
-    // packages that exist in a single directory on a single search path.
-    let Module::File(module) = module else {
-        return None;
-    };
+    match module {
+        Module::Namespace(ns_package) => {
+            all_submodules_for_namespace_package(db, ns_package)
+        }
+        Module::File(file_module) => {
+            all_submodules_for_file_module(db, file_module)
+        }
+    }
+}
+
+/// Compute all submodules for a namespace package (PEP 420).
+///
+/// Namespace packages can span multiple directories across multiple search paths.
+/// This function iterates over all search paths and collects submodules from each
+/// directory that contributes to the namespace package.
+fn all_submodules_for_namespace_package<'db>(
+    db: &'db dyn Db,
+    ns_package: NamespacePackage<'db>,
+) -> Option<Vec<Module<'db>>> {
+    fn is_submodule(
+        is_dir: bool,
+        is_file: bool,
+        basename: Option<&str>,
+        extension: Option<&str>,
+    ) -> bool {
+        is_dir
+            || (is_file
+                && matches!(extension, Some("py" | "pyi"))
+                && !matches!(basename, Some("__init__.py" | "__init__.pyi")))
+    }
+
+    fn find_package_init_system(db: &dyn Db, dir: &SystemPath) -> Option<File> {
+        system_path_to_file(db, dir.join("__init__.pyi"))
+            .or_else(|_| system_path_to_file(db, dir.join("__init__.py")))
+            .ok()
+    }
+
+    let name = ns_package.name(db);
+    let system = db.system();
+
+    // Convert the module name to a relative path (e.g., "foo.bar" -> "foo/bar")
+    let relative_path = name.as_str().replace('.', "/");
+
+    let mut submodules = Vec::new();
+    // Track which submodule names we've already seen to handle search path priority
+    let mut seen_names: FxHashSet<String> = FxHashSet::default();
+
+    // Iterate over all search paths (in priority order)
+    for search_path in search_paths(db, ModuleResolveMode::StubsAllowed) {
+        // Skip standard library search paths - namespace packages don't exist there
+        if search_path.is_standard_library() {
+            continue;
+        }
+
+        let Some(search_path_system) = search_path.as_system_path() else {
+            continue;
+        };
+
+        let ns_dir = search_path_system.join(&relative_path);
+
+        // Check if this search path contributes to the namespace package
+        if !system.is_directory(&ns_dir) {
+            continue;
+        }
+
+        // Read the revision on the corresponding file root to register an explicit
+        // dependency on this directory tree. When the revision gets bumped, the cache
+        // that Salsa creates for this routine will be invalidated.
+        if let Some(root) = db.files().root(db, &ns_dir) {
+            let _ = root.revision(db);
+        }
+
+        let Ok(entries) = system.read_directory(&ns_dir) else {
+            tracing::debug!(
+                "Failed to read {ns_dir:?} when looking for namespace package submodules"
+            );
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let ty = entry.file_type();
+            let path = entry.path();
+
+            if !is_submodule(
+                ty.is_directory(),
+                ty.is_file(),
+                path.file_name(),
+                path.extension(),
+            ) {
+                continue;
+            }
+
+            let Some(stem) = path.file_stem() else {
+                continue;
+            };
+
+            // Skip if we've already seen this submodule name from a higher-priority search path
+            if !seen_names.insert(stem.to_string()) {
+                continue;
+            }
+
+            let Some(submodule_name_part) = ModuleName::new(stem) else {
+                continue;
+            };
+
+            let mut submodule_name = name.clone();
+            submodule_name.extend(&submodule_name_part);
+
+            if ty.is_directory() {
+                // Check if it's a regular package (has __init__.py) or a namespace package
+                if let Some(init_file) = find_package_init_system(db, path) {
+                    submodules.push(Module::file_module(
+                        db,
+                        submodule_name,
+                        ModuleKind::Package,
+                        search_path.clone(),
+                        init_file,
+                    ));
+                } else {
+                    // It's a nested namespace package
+                    submodules.push(Module::namespace_package(db, submodule_name));
+                }
+            } else {
+                // It's a file module
+                if let Ok(file) = system_path_to_file(db, path) {
+                    submodules.push(Module::file_module(
+                        db,
+                        submodule_name,
+                        ModuleKind::Module,
+                        search_path.clone(),
+                        file,
+                    ));
+                }
+            }
+        }
+    }
+
+    if submodules.is_empty() {
+        None
+    } else {
+        Some(submodules)
+    }
+}
+
+/// Compute all submodules for a regular file-based module/package.
+fn all_submodules_for_file_module<'db>(
+    db: &'db dyn Db,
+    module: FileModule<'db>,
+) -> Option<Vec<Module<'db>>> {
+    fn is_submodule(
+        is_dir: bool,
+        is_file: bool,
+        basename: Option<&str>,
+        extension: Option<&str>,
+    ) -> bool {
+        is_dir
+            || (is_file
+                && matches!(extension, Some("py" | "pyi"))
+                && !matches!(basename, Some("__init__.py" | "__init__.pyi")))
+    }
+
+    fn find_package_init_system(db: &dyn Db, dir: &SystemPath) -> Option<File> {
+        system_path_to_file(db, dir.join("__init__.pyi"))
+            .or_else(|_| system_path_to_file(db, dir.join("__init__.py")))
+            .ok()
+    }
+
+    fn find_package_init_vendored(db: &dyn Db, dir: &VendoredPath) -> Option<File> {
+        vendored_path_to_file(db, dir.join("__init__.pyi"))
+            .or_else(|_| vendored_path_to_file(db, dir.join("__init__.py")))
+            .ok()
+    }
+
     if !matches!(module.kind(db), ModuleKind::Package) {
         return None;
     }
